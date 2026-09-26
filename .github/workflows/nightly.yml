@@ -1,0 +1,784 @@
+# Nightly Windows builds of deblasis/wintty, published as prereleases of this
+# repository.
+#
+# This repository holds this workflow and a README, and nothing else. There is
+# no fork of the source to keep in sync: every run reads the upstream commit,
+# clones it, builds it, and tags the release with it. Nothing is ever pushed, so
+# a run cannot leave a branch in a state nobody built, and there is no merge to
+# resolve.
+#
+# Shape:
+#
+#   plan          resolves the upstream commit, and decides per platform
+#                 whether that commit still needs a build
+#   build-x64     | run in parallel, each uploads one zip
+#   build-arm64   |
+#   release       runs once both are finished, publishes one release with
+#                 whatever zips arrived - one platform succeeding is enough
+#
+# Why one file and not one file per platform. A single release that waits for
+# both platforms cannot be assembled by two independent scheduled workflows:
+# each would publish its own release, and coordinating them from a third
+# workflow on `workflow_run` fires twice per night (once per completing
+# workflow) and has to reach across runs to fetch artifacts. Two jobs in one
+# workflow get it for free. They are deliberately not a matrix either: the
+# release job has to ask "did x64 succeed" and "did arm64 succeed" separately,
+# and a matrix collapses those into one aggregate result. Two jobs also let each
+# platform carry its own comments without `if: matrix.platform == ...` noise on
+# every step.
+#
+# The two things this workflow changes about the build are -Dcpu and, on arm64,
+# -Dtarget, both in the "Build libghostty" steps. Read those steps, and the
+# arm64 job's comment about why it cross-compiles, before changing anything.
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Rebuild and republish even if this commit already has a nightly"
+        required: false
+        default: "false"
+      skip_release:
+        description: "Build, but do not publish a release"
+        required: false
+        default: "false"
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: deblasis/wintty
+  UPSTREAM_BRANCH: windows
+  SRC: src
+
+jobs:
+  # Resolves what to build. No checkout and no clone: it reads two things out of
+  # upstream and nothing else, and it is on ubuntu because a Linux runner costs
+  # a tenth of what a Windows one does for the same 20 seconds of work.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      zig_version: ${{ steps.plan.outputs.zig_version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      do_work_x64: ${{ steps.plan.outputs.do_work_x64 }}
+      do_work_arm64: ${{ steps.plan.outputs.do_work_arm64 }}
+    steps:
+      - name: Resolve upstream commit and decide what to build
+        id: plan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Explicit and not optional: with this unset, gh resolves the
+          # repository from the git remotes, and a clone of another repository
+          # sitting in the workspace is one of the things it will find.
+          GH_REPO: ${{ github.repository }}
+          FORCE: ${{ inputs.force_build }}
+        run: |
+          set -euo pipefail
+
+          # gh api rather than a clone. A --depth 1 clone of this source is a
+          # few hundred megabytes, and this job wants one sha and one line of
+          # build.zig.zon out of it.
+          #
+          # It also removes a race the two build jobs would otherwise have.
+          # They clone independently, so without one planned sha the x64 leg
+          # could build the commit from before an upstream push and the arm64
+          # leg the commit from after it, and the single release tag would
+          # describe neither. Both legs check out this exact sha.
+          sha=$(gh api "repos/${UPSTREAM_REPO}/commits/${UPSTREAM_BRANCH}" --jq '.sha')
+          test -n "$sha" || { echo "::error::could not resolve ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}"; exit 1; }
+          short=${sha:0:7}
+
+          # The zig version is upstream's to choose, so it is read out of the
+          # planned commit instead of pinned here: .minimum_zig_version in
+          # build.zig.zon is the compiler upstream builds with, and reading it
+          # means a bump on their side moves this workflow instead of leaving it
+          # on an old zig until someone notices. mlugg/setup-zig cannot read
+          # that file itself - it looks in the workspace, and this repository
+          # has no build.zig.zon.
+          zig_version=$(gh api "repos/${UPSTREAM_REPO}/contents/build.zig.zon?ref=${sha}" \
+            --jq '.content' | base64 -d \
+            | sed -n 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
+          test -n "$zig_version" || { echo "::error::no .minimum_zig_version in build.zig.zon at ${sha}"; exit 1; }
+
+          # Tags end in the short sha, so the release for a commit is findable
+          # without knowing which night created it. Read the list into a
+          # variable first: piping into `grep -q` under `set -o pipefail` flips
+          # the test false when grep exits early and the producer takes SIGPIPE.
+          tags=$(gh release list --limit 200 --json tagName --jq '.[].tagName')
+          existing=""
+          for t in $tags; do
+            case "$t" in
+              *"-${short}") existing="$t"; break ;;
+            esac
+          done
+
+          # One release per upstream commit, reused across nights. A night that
+          # only managed to publish one platform leaves a release behind, and
+          # the next night adds to that release rather than opening a second one
+          # for the same commit.
+          if [ -n "$existing" ]; then
+            tag="$existing"
+            assets=$(gh release view "$existing" --json assets --jq '.assets[].name')
+          else
+            tag="wintty-nightly-$(date -u +%Y%m%d)-${short}"
+            assets=""
+          fi
+
+          # Per platform, "already published" is read off the release's asset
+          # names rather than the tag alone. That is the whole reason the check
+          # is per platform: when arm64 fails and x64 succeeds, tomorrow's run
+          # has to rebuild arm64 and not x64.
+          published_x64=false
+          published_arm64=false
+          case "$assets" in *"wintty-nightly-win-x64.zip"*)   published_x64=true ;; esac
+          case "$assets" in *"wintty-nightly-win-arm64.zip"*) published_arm64=true ;; esac
+
+          do_work_x64=false
+          do_work_arm64=false
+          if [ "$published_x64" = "false" ] || [ "$FORCE" = "true" ]; then do_work_x64=true; fi
+          if [ "$published_arm64" = "false" ] || [ "$FORCE" = "true" ]; then do_work_arm64=true; fi
+
+          {
+            echo "### Nightly plan"
+            echo ""
+            echo "- upstream: \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`"
+            echo "- commit: \`${sha}\`"
+            echo "- zig: ${zig_version}"
+            echo "- release tag: \`${tag}\`"
+            echo "- x64: already published=${published_x64}, build=${do_work_x64}"
+            echo "- arm64: already published=${published_arm64}, build=${do_work_arm64}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "sha=${sha}"
+            echo "zig_version=${zig_version}"
+            echo "tag=${tag}"
+            echo "do_work_x64=${do_work_x64}"
+            echo "do_work_arm64=${do_work_arm64}"
+          } >> "$GITHUB_OUTPUT"
+
+  build-x64:
+    needs: plan
+    if: needs.plan.outputs.do_work_x64 == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      PLATFORM: x64
+      RID: win-x64
+      # x86-64-v3 is v2 plus AVX, AVX2, BMI1/2, F16C, FMA, LZCNT and MOVBE, and
+      # no AVX-512 of any kind. It covers every CPU since Haswell (2013) and
+      # Excavator (2015). zig names the microarchitecture levels with
+      # underscores - `zig targets` lists x86_64, x86_64_v2, x86_64_v3,
+      # x86_64_v4 - and baseline is the level below this one: SSE2 only, which
+      # costs the terminal's SIMD hot paths real throughput.
+      ZIG_CPU: x86_64_v3
+      ARTIFACT: wintty-nightly-win-x64.zip
+      DIST: dist-x64
+    steps:
+      # Nothing in this repository is an input to the build, but the release job
+      # wants a commit here to point the tag at, and checking out keeps the
+      # clone below on the same footing as a normal run.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Clone upstream at the planned commit
+        shell: bash
+        env:
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          # --depth 1 is enough, and not a shortcut. build.zig takes the app
+          # version from build.zig.zon (or a VERSION file), and
+          # src/build/GitVersion.zig asks git for exactly three things: the
+          # current branch, the current short hash, and an exact-match v* / tip
+          # tag - with "no such tag" as an outcome it handles as expected. All
+          # of them work in a shallow clone that has no tags at all. A full
+          # clone would be hundreds of megabytes of history that no build step
+          # ever reads.
+          git clone --depth 1 --branch "${UPSTREAM_BRANCH}" \
+            "https://github.com/${UPSTREAM_REPO}.git" "${SRC}"
+
+          # Pin to the commit the plan job picked, not to whatever the branch
+          # tip is now. Cloning the branch is the cheapest way to get the tree,
+          # but between the plan job and this step upstream may have pushed, and
+          # the release is tagged with the planned commit. GitHub serves a
+          # fetch of an arbitrary reachable sha, which is the same mechanism
+          # actions/checkout uses for `fetch-depth: 1` with a pinned ref.
+          if [ "$(git -C "${SRC}" rev-parse HEAD)" != "${SHA}" ]; then
+            git -C "${SRC}" fetch --depth 1 origin "${SHA}"
+            git -C "${SRC}" checkout --detach "${SHA}"
+          fi
+          if [ "$(git -C "${SRC}" rev-parse HEAD)" != "${SHA}" ]; then
+            echo "::error::clone is not at the planned commit ${SHA}"
+            exit 1
+          fi
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ needs.plan.outputs.zig_version }}
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          # Upstream's pin, read out of the clone for the same reason as zig's.
+          global-json-file: src/global.json
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          zig version
+          if ($LASTEXITCODE -ne 0) { throw 'zig is not on PATH' }
+          dotnet --version
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet is not on PATH' }
+
+          # HlslStep.zig resolves dxc.exe from the Windows SDK as
+          # <kits>\bin\<version>\<target-arch>\dxc.exe, falling back to
+          # `where dxc.exe`. When it finds nothing it logs "dxc.exe not found;
+          # HLSL shaders will not be compiled" and returns null - but
+          # src/renderer/directx12/shaders.zig then @embedFile's the nine
+          # anonymous imports that step would have registered, so the warning is
+          # followed by a hard compile error that names a module and not dxc.
+          # Print what is actually present so that failure needs no bisect.
+          $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          Write-Host "dxc candidates under $kits for arch '$env:PLATFORM':"
+          $hit = $null
+          if (Test-Path $kits) {
+            Get-ChildItem -Path $kits -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+              Sort-Object { [version]$_.Name } -Descending |
+              ForEach-Object { Join-Path $_.FullName (Join-Path $env:PLATFORM 'dxc.exe') } |
+              ForEach-Object {
+                $exists = Test-Path $_
+                Write-Host ("  {0,-5} {1}" -f $exists, $_)
+                if ($exists -and -not $hit) { $hit = $_ }
+              }
+          }
+          $onPath = (Get-Command dxc.exe -ErrorAction SilentlyContinue).Source
+          Write-Host "dxc on PATH: $(if ($onPath) { $onPath } else { '<none>' })"
+          if (-not $hit -and -not $onPath) {
+            Write-Host '::warning::no dxc.exe for this target arch; zig will warn and the HLSL @embedFile will fail the build'
+          }
+
+      - name: Build libghostty (ReleaseFast)
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+
+          # `just build-dll-release` is this command without -Dcpu, and a just
+          # recipe takes no arguments it did not declare, so the flag has no way
+          # through it.
+          #
+          # -Dcpu is not optional here, on either runner. zig's default target
+          # for a native build is the *host* CPU, features and all:
+          # src/build/Config.zig resolves b.standardTargetOptions(.{}) against
+          # the machine running the build. The x64 runner has AVX-512, so the
+          # default produces a libghostty carrying AVX-512 instructions -
+          # EVEX-encoded vpcmpnleuw / kortestw / vpmovwb, measured in a
+          # UTF-16 -> ASCII narrowing loop - and every launch on a CPU without
+          # them dies with
+          #   0xC000001D STATUS_ILLEGAL_INSTRUCTION
+          # Intel fuses AVX-512 off on every 12th-gen Core and later consumer
+          # part, which is most machines this would ever be downloaded onto.
+          # The arm64 runner has the same shape of problem: the default is
+          # whatever Neoverse-class core Azure rents out, which is not what a
+          # Snapdragon 8cx or an SQ1 in a Surface Pro X is.
+          #
+          # Every other packaging path in this repository already passes a CPU
+          # level - flatpak, snap, nix and the debian Dockerfile all use
+          # -Dcpu=baseline, and PACKAGING.md documents it as "avoid building for
+          # newer CPU features that may not be available on all target
+          # machines". Windows was the one path relying on the default.
+          #
+          # No -Dtarget here: this job builds for the architecture it is running
+          # on. The arm64 job does pass -Dtarget, because it cross-compiles, and
+          # it has to work around dxc.exe resolution to do so - see that job.
+          #
+          # The InvalidExe that -Dtarget caused the first time is worth knowing
+          # about because it is the shape of the problem, not a one-off:
+          # HlslStep.zig picks dxc.exe by the *target* arch, so
+          # -Dtarget=aarch64-windows made an x64 runner spawn the ARM64 dxc.exe
+          # and fail 11 shader steps with
+          #   failed to spawn and capture stdio from ...\arm64\dxc.exe: InvalidExe
+          zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu="${ZIG_CPU}"
+
+      - name: Build WinUI shell (Release)
+        shell: pwsh
+        working-directory: src
+        run: |
+          # RestoreLockedMode: build exactly what the committed
+          # packages.lock.json files resolve, the way upstream's own
+          # windows-tests.yml does. If this fails, the locks drifted upstream
+          # and the fix belongs there rather than here.
+          dotnet build windows/Ghostty.sln `
+            /p:Platform=$env:PLATFORM /p:Configuration=Release /p:RestoreLockedMode=true
+          if ($LASTEXITCODE -ne 0) { throw "build failed exit=$LASTEXITCODE" }
+
+      - name: Publish NativeAOT binary
+        shell: pwsh
+        working-directory: src
+        run: |
+          # pwsh, not bash. Git Bash's MSYS2 runtime rewrites a `/p:...`
+          # argument on the way to the native dotnet.exe, so `/p:Platform=x64`
+          # arrives as `p:Platform=x64` and MSBuild reads it as a second
+          # project:
+          #   MSBUILD : error MSB1008: Only one project can be specified.
+          # windows/scripts/release-smoke.ps1 runs this command under pwsh, so
+          # this step does too. Do not "fix" it back to bash.
+          #
+          # --no-restore because the build step above already restored this
+          # exact graph. It works for win-x64 specifically because the
+          # committed windows/Ghostty/packages.lock.json carries a
+          # `net10.0-windows10.0.19041/win-x64` dependency key, so a plain
+          # restore emits that RID target into project.assets.json. The arm64
+          # job cannot use --no-restore for the same reason; see its step.
+          dotnet publish windows/Ghostty/Ghostty.csproj `
+            -c Release -r $env:RID /p:Platform=$env:PLATFORM --no-restore
+          if ($LASTEXITCODE -ne 0) { throw "NativeAOT publish failed exit=$LASTEXITCODE" }
+
+      - name: Package portable build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:GITHUB_WORKSPACE $env:SRC
+
+          # Not a hardcoded path: the SDK is free to place the RID publish under
+          # a different folder, which is why release-smoke.ps1 falls back to a
+          # search too. A hardcoded path here would break on the next TFM bump.
+          $exe = Get-ChildItem -Path (Join-Path $src 'windows/Ghostty/bin') -Recurse -Filter 'Wintty.exe' |
+                 Where-Object { $_.FullName -match '\\publish\\' } |
+                 Sort-Object LastWriteTime -Descending |
+                 Select-Object -First 1
+          if (-not $exe) { throw 'publish output (Wintty.exe under a publish folder) not found' }
+          $publishDir = Split-Path $exe.FullName
+          Write-Host "publish dir: $publishDir"
+
+          # #1086: without this resource dll AppNotificationManager.Register()
+          # throws on every launch and every toast is dead. release-smoke.ps1
+          # gates on the same file.
+          $insights = Join-Path $publishDir 'Microsoft.WindowsAppRuntime.Insights.Resource.dll'
+          if (-not (Test-Path $insights)) {
+            throw "publish folder lacks Microsoft.WindowsAppRuntime.Insights.Resource.dll (#1086): every toast would be dead. The Ghostty.csproj publish target that extracts it did not run."
+          }
+
+          # The console shim reaches the publish folder through
+          # CopyCliShimForPublish. Its absence degrades the CLI rather than
+          # breaking the app, so this warns instead of failing the night.
+          $shim = Join-Path $publishDir 'bin\wintty.exe'
+          if (-not (Test-Path $shim)) {
+            Write-Host "::warning::CLI shim missing at $shim (CopyCliShimForPublish did not run)"
+          }
+
+          if (Test-Path $env:ARTIFACT) { Remove-Item $env:ARTIFACT -Force }
+          Compress-Archive -Path (Join-Path $publishDir '*') -DestinationPath $env:ARTIFACT -CompressionLevel Optimal
+
+          $hash = (Get-FileHash $env:ARTIFACT -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($env:ARTIFACT)" | Out-File -Encoding ascii "$($env:ARTIFACT).sha256"
+
+          Get-Item $env:ARTIFACT | Select-Object Name, Length | Format-List
+          Write-Host "sha256: $hash"
+
+      # Hand the zip to the release job. The build jobs do not publish: the
+      # release is one thing assembled from both platforms, and a job that
+      # publishes on its own would race the other one.
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ env.DIST }}
+          path: |
+            ${{ env.ARTIFACT }}
+            ${{ env.ARTIFACT }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  build-arm64:
+    needs: plan
+    if: false  # disabled: zig's LLVM bug (ziglang/zig#31865) makes
+    # native aarch64-windows compilation crash with SIGSEGV on
+    # windows-11-arm. Cross-compiling from x64 also requires workarounds
+    # for dxsc.exe and IconGen. Wait for zig 0.18+ or upstream fix
+    # before re-enabling.
+    # Runs on windows-11-arm but will not execute until the fix lands.
+    runs-on: windows-11-arm
+    timeout-minutes: 180
+    env:
+      PLATFORM: arm64
+      RID: win-arm64
+      TARGET: aarch64-windows
+      # baseline = ARMv8.0-A plus NEON, the lowest level zig has on arm64, and
+      # the level upstream's own packaging paths use - flatpak, snap, nix and the
+      # debian Dockerfile all pass -Dcpu=baseline, and PACKAGING.md documents it
+      # as "avoid building for newer CPU features that may not be available on
+      # all target machines".
+      #
+      # It is NOT a workaround for the crash this job used to have. That was the
+      # toolchain bug in the job comment, and the CPU string was never at fault:
+      # the same crash happened at generic+v8_2a, generic+v8_1a and baseline.
+      # Raising the level to generic+v8_1a - which buys LSE atomics
+      # (single-instruction LDADD/CAS/SWP instead of LL/SC retry loops, and this
+      # program is multithreaded) and hardware CRC-32 - is a separate question,
+      # to be measured once this leg builds at all.
+      #
+      # If it is ever raised, two things about the spelling are not guessable:
+      #
+      #   * zig has NO architecture-level aarch64 CPU model. The model table is
+      #     vendor cores only - cortex_a76, neoverse_n1, apple_m1 - plus
+      #     `generic`. There is no `armv8_1a` model, so the x86_64_v3-style
+      #     spelling does not exist on this side.
+      #   * a level is a FEATURE, and its name on the command line is the zig
+      #     name, not the LLVM name: lib/std/Target/Query.zig matches
+      #     `feature.name`, so `+v8_1a` is correct and `+v8.1a` (the LLVM
+      #     spelling) fails with error.UnknownCpuFeature. Zig prints the accepted
+      #     names on that failure, which is the fastest way to re-check.
+      ZIG_CPU: generic+v8_1a
+      ARTIFACT: wintty-nightly-win-arm64.zip
+      DIST: dist-arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Clone upstream at the planned commit
+        shell: bash
+        env:
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${UPSTREAM_BRANCH}" \
+            "https://github.com/${UPSTREAM_REPO}.git" "${SRC}"
+          if [ "$(git -C "${SRC}" rev-parse HEAD)" != "${SHA}" ]; then
+            git -C "${SRC}" fetch --depth 1 origin "${SHA}"
+            git -C "${SRC}" checkout --detach "${SHA}"
+          fi
+          if [ "$(git -C "${SRC}" rev-parse HEAD)" != "${SHA}" ]; then
+            echo "::error::clone is not at the planned commit ${SHA}"
+            exit 1
+          fi
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ needs.plan.outputs.zig_version }}
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: src/global.json
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          zig version
+          if ($LASTEXITCODE -ne 0) { throw 'zig is not on PATH' }
+          dotnet --version
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet is not on PATH' }
+          # On the native ARM64 runner, dxsc.exe is found natively at
+          # <kits>\bin\<version>\arm64\dxc.exe by HlslStep.zig.
+          # No cross-compilation shims or copies are needed.
+
+      - name: Build libghostty (ReleaseFast)
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # Native build on the ARM64 runner. -Dtarget names the
+          # architecture and the runner is aarch64.
+          # -Dcpu is not optional here either - the plan job explains
+          # what the native default would carry.
+          zig build -Dapp-runtime=none -Doptimize=ReleaseFast \
+            -Dtarget="${TARGET}" -Dcpu="${ZIG_CPU}"
+
+      - name: Build WinUI shell (Release)
+        shell: pwsh
+        working-directory: src
+        run: |
+          # The solution maps ARM64 for every project, and the Ghostty.csproj
+          # ARM64 conditions pull conpty.dll / OpenConsole.exe /
+          # dxcompiler.dll from their packages' arm64 folders - each of which is
+          # an Error, not a warning, if the package stops shipping them.
+          dotnet build windows/Ghostty.sln `
+            /p:Platform=$env:PLATFORM /p:Configuration=Release /p:RestoreLockedMode=true
+          if ($LASTEXITCODE -ne 0) { throw "build failed exit=$LASTEXITCODE" }
+
+      - name: Publish NativeAOT binary
+        shell: pwsh
+        working-directory: src
+        run: |
+          # pwsh, not bash, for the MSB1008 reason the x64 job documents.
+          #
+          # No --no-restore and no RestoreLockedMode, unlike the x64 job. The
+          # committed windows/Ghostty/packages.lock.json is win-x64-locked -
+          # its dependency keys are `net10.0-windows10.0.19041` and
+          # `net10.0-windows10.0.19041/win-x64` - so a locked restore for
+          # win-arm64 fails NU1004 ("the project's runtime identifier changed"),
+          # and there is no arm64 lock to lock against: upstream only ever
+          # restores the x64 RID. Letting publish restore is what makes the RID
+          # target appear in project.assets.json. The side effect is that this
+          # leg resolves packages unlocked, and rewrites the three
+          # packages.lock.json files in the throwaway clone.
+          dotnet publish windows/Ghostty/Ghostty.csproj `
+            -c Release -r $env:RID /p:Platform=$env:PLATFORM
+          if ($LASTEXITCODE -ne 0) { throw "NativeAOT publish failed exit=$LASTEXITCODE" }
+
+      - name: Package portable build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:GITHUB_WORKSPACE $env:SRC
+
+          $exe = Get-ChildItem -Path (Join-Path $src 'windows/Ghostty/bin') -Recurse -Filter 'Wintty.exe' |
+                 Where-Object { $_.FullName -match '\\publish\\' } |
+                 Sort-Object LastWriteTime -Descending |
+                 Select-Object -First 1
+          if (-not $exe) { throw 'publish output (Wintty.exe under a publish folder) not found' }
+          $publishDir = Split-Path $exe.FullName
+          Write-Host "publish dir: $publishDir"
+
+          # #1086, as in the x64 job.
+          $insights = Join-Path $publishDir 'Microsoft.WindowsAppRuntime.Insights.Resource.dll'
+          if (-not (Test-Path $insights)) {
+            throw "publish folder lacks Microsoft.WindowsAppRuntime.Insights.Resource.dll (#1086): every toast would be dead. The Ghostty.csproj publish target that extracts it did not run."
+          }
+
+          $shim = Join-Path $publishDir 'bin\wintty.exe'
+          if (-not (Test-Path $shim)) {
+            Write-Host "::warning::CLI shim missing at $shim (CopyCliShimForPublish did not run)"
+          }
+
+          if (Test-Path $env:ARTIFACT) { Remove-Item $env:ARTIFACT -Force }
+          Compress-Archive -Path (Join-Path $publishDir '*') -DestinationPath $env:ARTIFACT -CompressionLevel Optimal
+
+          $hash = (Get-FileHash $env:ARTIFACT -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($env:ARTIFACT)" | Out-File -Encoding ascii "$($env:ARTIFACT).sha256"
+
+          Get-Item $env:ARTIFACT | Select-Object Name, Length | Format-List
+          Write-Host "sha256: $hash"
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ env.DIST }}
+          path: |
+            ${{ env.ARTIFACT }}
+            ${{ env.ARTIFACT }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # The single publishing point. It waits for both platform jobs - `needs` is
+  # satisfied by a job finishing, whether it succeeded or failed - and then
+  # publishes whatever arrived.
+  release:
+    needs: [plan, build-x64, build-arm64]
+    # This condition asks the *plan*, not the build jobs. `do_work_*` means
+    # "this platform still needs a build", so at least one true means a build
+    # job ran and something may be waiting to be published; whether it actually
+    # arrived is decided by the zip guard in the publish step below, which
+    # annotates the notes when a platform is absent. Both false means every
+    # platform is already published and there is nothing to do, so the job is
+    # skipped and no runner is spent. If the plan itself failed its outputs are
+    # empty, so this is skipped too - correct, since nothing was built.
+    #
+    # Do NOT spell this as `needs.build-*.result == 'success'`. A leg whose
+    # platform is already published is reported as 'skipped', not 'success', so
+    # that spelling makes the release job's fate depend on the *other* leg:
+    # run 36257849094 had x64 skipped (already released), arm64 failed, and the
+    # release was skipped - the arm64 zip was never retried and the run went red
+    # with no release at all. 'skipped' means "nothing to do here", which is not
+    # a failure, and it is the normal state of the leg that has nothing to
+    # rebuild. `always()` stays because without it a failed build leg skips this
+    # job by default, which is the bug it is here to fix.
+    #
+    # Do NOT add `continue-on-error: true` to the build jobs to stop a failure
+    # colouring the run red. That hides the failure without producing an
+    # artifact; the build jobs are meant to stay red, and the release goes out
+    # anyway. What a missing platform needs is to be *said*, which the publish
+    # step does below.
+    if: >-
+      always()
+      && inputs.skip_release != 'true'
+      && (needs.plan.outputs.do_work_x64 == 'true' || needs.plan.outputs.do_work_arm64 == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          # A pattern rather than two named downloads, so the job does not care
+          # how many legs ran. merge-multiple puts both zips in one directory,
+          # which is what gh release create wants anyway. Downloading inside the
+          # same run needs no token and no `actions: read`: it goes over the
+          # run's own runtime token, not the REST API.
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish nightly release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          # Each leg's outcome, so the notes can say *why* a platform is absent
+          # instead of quietly omitting it. A missing platform is expected - one
+          # failed leg is not fatal - but it must not be silent, and a reader of
+          # the release page cannot see the Actions tab.
+          RESULT_X64: ${{ needs.build-x64.result }}
+          RESULT_ARM64: ${{ needs.build-arm64.result }}
+        run: |
+          set -euo pipefail
+
+          result_of() {
+            case "$1" in
+              x64)   printf '%s' "${RESULT_X64}" ;;
+              arm64) printf '%s' "${RESULT_ARM64}" ;;
+            esac
+          }
+
+          # This run's own new files. The decision to publish hangs on these,
+          # not on the platform list below: a run whose only pending platform is
+          # the one that failed contributes nothing at all, and
+          # `gh release upload "$TAG"` with no files is an error rather than a
+          # no-op. A zip is the unit of a release and its checksum only rides
+          # along, so the guard counts zips - which also means the platform list
+          # below can never come out empty.
+          zips=()
+          for f in dist/*.zip; do
+            if [ -f "$f" ]; then zips+=("$f"); fi
+          done
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "::warning::no build artifact arrived; nothing to publish"
+            exit 0
+          fi
+          assets=()
+          for f in dist/*.zip dist/*.zip.sha256; do
+            if [ -f "$f" ]; then assets+=("$f"); fi
+          done
+
+          # Which platforms the *release* will carry once this step is done, and
+          # which it will not. The set is this run's artifacts unioned with the
+          # assets already on the release, because those two are not the same
+          # thing and reading only the directory gets the notes wrong: a night
+          # that rebuilds one platform rewrites the notes of a release the other
+          # platform already filled, and `gh release edit` replaces the notes
+          # wholesale, so the platform that was *not* rebuilt would be announced
+          # as missing while its zip sits in the same release. That is exactly
+          # run 36257849094's shape - x64 already published, arm64 retried.
+          on_release=$(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null || true)
+
+          present=""
+          missing=""
+          for p in x64 arm64; do
+            zip="wintty-nightly-win-${p}.zip"
+            kept=false
+            case "$on_release" in *"$zip"*) kept=true ;; esac
+            if [ -f "dist/${zip}" ] || [ "$kept" = "true" ]; then
+              present="${present} ${p}"
+            else
+              missing="${missing} ${p}"
+            fi
+          done
+          present=${present# }
+          missing=${missing# }
+
+          echo "platforms in this release: ${present}"
+          echo "added by this run: ${assets[*]}"
+          if [ -n "$missing" ]; then
+            echo "::warning::no artifact for: ${missing} - publishing the rest anyway"
+          fi
+
+          # printf with single-quoted formats: no backtick escaping, no heredoc.
+          {
+            printf 'Unsigned portable Windows build of `%s@%s`, commit `%s`.\n\n' \
+              "$UPSTREAM_REPO" "$UPSTREAM_BRANCH" "$SHA"
+            printf -- '- Upstream commit: https://github.com/%s/commit/%s\n' "$UPSTREAM_REPO" "$SHA"
+            printf -- '- Platforms in this release: %s\n' "$present"
+            if [ -n "$missing" ]; then
+              printf -- '- **Missing from this release**:'
+              for p in $missing; do
+                printf ' `%s` (build job: %s)' "$p" "$(result_of "$p")"
+              done
+              printf '\n'
+            fi
+            # One line per platform the release carries, not per file this run
+            # happened to upload: in the split case the other platform's
+            # checksum was written by an earlier night and its value is not in
+            # dist/ any more, so the line points at its own attached asset
+            # rather than dropping the platform from the list.
+            for p in $present; do
+              f="dist/wintty-nightly-win-${p}.zip.sha256"
+              if [ -f "$f" ]; then
+                printf -- '- `wintty-nightly-win-%s.zip` SHA256: `%s`\n' "$p" "$(cut -d' ' -f1 < "$f")"
+              else
+                printf -- '- `wintty-nightly-win-%s.zip` SHA256: in its own `.sha256` asset\n' "$p"
+              fi
+            done
+            printf -- '- Built by: `.github/workflows/nightly.yml`\n\n'
+            if [ -n "$missing" ]; then
+              printf 'This release is incomplete: the platform named as missing above has no build in this run. It is not dropped - the next run that still finds it absent rebuilds it and attaches it to this same release.\n\n'
+            fi
+            printf '**Unofficial build.** Not a Wintty release - the official builds live at https://github.com/%s. It is an unreviewed tip of the upstream branch, so a nightly can be broken.\n' "$UPSTREAM_REPO"
+          } > notes.md
+
+          # --target is this repository's commit, not the upstream one: it is
+          # the commit the tag points at, and the upstream sha does not exist
+          # here.
+          publish() {
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              # An earlier night published this commit for one platform only.
+              # Add to that release instead of opening a second one for the
+              # same commit, and refresh the notes so the platform list stays
+              # true. The title keeps the date of the tag it was created with.
+              gh release upload "$TAG" "${assets[@]}" --clobber || return $?
+              gh release edit "$TAG" --notes-file notes.md
+            else
+              gh release create "$TAG" "${assets[@]}" \
+                --target "$GITHUB_SHA" \
+                --prerelease \
+                --title "Wintty nightly $(date -u +%Y%m%d) (${SHA:0:7})" \
+                --notes-file notes.md
+            fi
+          }
+
+          # Retried, because this API has answered this exact call with "HTTP
+          # 403: Resource not accessible by integration" and then accepted the
+          # identical call minutes later. Run 36286437049's release job failed
+          # that way at 02:05:23 with `Contents: write` in the runner's
+          # GITHUB_TOKEN banner; the rerun of that same job, same commit, same
+          # token permissions, same repository settings, published at 02:22:20.
+          # Nothing in this file was touched in between. A flake like that
+          # costs a whole night's build, which is the one thing this job exists
+          # to prevent.
+          #
+          # Re-deciding create-vs-upload on every attempt is what makes the
+          # retry safe rather than dangerous: `gh release create` is not
+          # idempotent, so if a create did land server-side while the client
+          # never saw the reply, the next attempt finds the release and takes
+          # the `upload --clobber` + `edit` path instead of dying on
+          # already_exists.
+          #
+          # `publish || rc=$?` rather than a bare call, because `set -e` is
+          # ignored for the whole body of a function called in a condition
+          # position - a failing `gh release upload` inside `if publish` would
+          # otherwise fall through to `gh release edit` and report *its*
+          # status.
+          PUBLISH_ATTEMPTS=3
+          attempt=1
+          while [ "$attempt" -le "$PUBLISH_ATTEMPTS" ]; do
+            rc=0
+            publish || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              break
+            fi
+            if [ "$attempt" -eq "$PUBLISH_ATTEMPTS" ]; then
+              echo "::error::publishing failed after ${attempt} attempts (last exit ${rc})"
+              exit "$rc"
+            fi
+            echo "::warning::publish attempt ${attempt} failed (exit ${rc}); retrying"
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
