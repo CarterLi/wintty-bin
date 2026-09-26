@@ -1,0 +1,310 @@
+# Nightly Windows x64 build of deblasis/wintty, published as a prerelease of
+# this repository.
+#
+# This repository holds this workflow and its arm64 sibling, and nothing else.
+# There is no fork of the source to keep in sync: every run clones
+# deblasis/wintty@windows, builds that commit, and tags the release with the
+# commit it built. Nothing is ever pushed, so a run cannot leave a branch in a
+# state nobody built, and there is no merge to resolve.
+#
+# The source is cloned by URL and not through a remote named `upstream`: `gh`
+# prefers a remote called `upstream` over `origin` when it resolves which
+# repository to act on, so a remote with that name would point every `gh` call
+# at the source repo instead of this one. GH_REPO is set on those steps too.
+#
+# The one thing this workflow changes about the build is -Dcpu, in the
+# "Build libghostty" step. Read that step before changing anything here.
+name: nightly x64
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Rebuild and republish even if this commit already has a nightly"
+        required: false
+        default: "false"
+      skip_release:
+        description: "Build, but do not publish a release"
+        required: false
+        default: "false"
+
+concurrency:
+  group: nightly-x64
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: deblasis/wintty
+  UPSTREAM_BRANCH: windows
+  SRC: src
+  PLATFORM: x64
+  RID: win-x64
+  # x86-64-v3 is v2 plus AVX, AVX2, BMI1/2, F16C, FMA, LZCNT and MOVBE, and no
+  # AVX-512 of any kind. It covers every CPU since Haswell (2013) and Excavator
+  # (2015). zig names the microarchitecture levels with underscores -
+  # `zig targets` lists x86_64, x86_64_v2, x86_64_v3, x86_64_v4 - and baseline
+  # is the level below this one: SSE2 only, which costs the terminal's SIMD hot
+  # paths real throughput.
+  ZIG_CPU: x86_64_v3
+  ARTIFACT: wintty-nightly-win-x64.zip
+
+jobs:
+  build:
+    # A fork of this repository would otherwise publish its own nightlies on
+    # every schedule tick. If the repository moves to another account or org,
+    # update this: a job-level `if` that is false skips the whole run silently.
+    if: github.repository_owner == 'CarterLi'
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      # Nothing in this repository is an input to the build, but the release
+      # step needs a commit here to point the tag at.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Clone ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # --depth 1 is enough, and not a shortcut. build.zig takes the app
+          # version from build.zig.zon (or a VERSION file), and
+          # src/build/GitVersion.zig asks git for exactly three things: the
+          # current branch, the current short hash, and an exact-match v* / tip
+          # tag - with "no such tag" as an outcome it handles as expected. All
+          # of them work in a shallow clone that has no tags at all. A full
+          # clone would be hundreds of megabytes of history that no build step
+          # ever reads.
+          git clone --depth 1 --branch "${UPSTREAM_BRANCH}" \
+            "https://github.com/${UPSTREAM_REPO}.git" "${SRC}"
+
+          sha=$(git -C "${SRC}" rev-parse HEAD)
+          test -n "$sha" || { echo "::error::could not resolve the cloned HEAD"; exit 1; }
+          echo "upstream commit: ${sha}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+          # The zig version is upstream's to choose, so it is read out of the
+          # clone instead of pinned here: .minimum_zig_version in build.zig.zon
+          # is the compiler upstream builds with, and reading it means a bump on
+          # their side moves this job instead of leaving it on an old zig until
+          # someone notices. mlugg/setup-zig cannot read that file itself - it
+          # looks in the workspace, and this repository has no build.zig.zon.
+          zig_version=$(sed -n 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "${SRC}/build.zig.zon")
+          test -n "$zig_version" || { echo "::error::no .minimum_zig_version in ${SRC}/build.zig.zon"; exit 1; }
+          echo "zig version: ${zig_version}"
+          echo "zig_version=${zig_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether a nightly is needed
+        id: plan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Explicit and not optional: with this unset, gh resolves the
+          # repository from the git remotes, and a clone of another repository
+          # sitting in the workspace is one of the things it will find.
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_SHA: ${{ steps.src.outputs.sha }}
+          FORCE: ${{ inputs.force_build }}
+        run: |
+          set -euo pipefail
+          short=${UPSTREAM_SHA:0:7}
+
+          # Read the tag list into a variable first: piping into `grep -q` under
+          # `set -o pipefail` flips the test false when grep exits early and the
+          # producer takes SIGPIPE.
+          tags=$(gh release list --limit 100 --json tagName --jq '.[].tagName')
+
+          # Tag names carry the platform and the short sha, so a tag matching
+          # both is the record that this exact upstream commit already has a
+          # nightly here. Without this a stalled upstream would republish the
+          # same build every night.
+          case "$tags" in
+            *"-${PLATFORM}-"*"-${short}") published=true ;;
+            *)                            published=false ;;
+          esac
+
+          if [ "$published" = "false" ] || [ "$FORCE" = "true" ]; then
+            do_work=true
+          else
+            do_work=false
+          fi
+
+          {
+            echo "### Nightly plan (${PLATFORM})"
+            echo ""
+            echo "- upstream: \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`"
+            echo "- commit: \`${UPSTREAM_SHA}\`"
+            echo "- nightly already published for this commit: ${published}"
+            echo "- build: ${do_work}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "do_work=${do_work}" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: steps.plan.outputs.do_work == 'true'
+        with:
+          version: ${{ steps.src.outputs.zig_version }}
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        if: steps.plan.outputs.do_work == 'true'
+        with:
+          # Upstream's pin, read from the clone for the same reason as zig's.
+          global-json-file: src/global.json
+
+      - name: Verify toolchain
+        if: steps.plan.outputs.do_work == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig version
+          dotnet --version
+
+      - name: Build libghostty (ReleaseFast)
+        if: steps.plan.outputs.do_work == 'true'
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+
+          # `just build-dll-release` is this command without -Dcpu, and a just
+          # recipe takes no arguments it did not declare, so the flag has no way
+          # through it.
+          #
+          # -Dcpu is not optional here. zig's default target for a native build
+          # is the *host* CPU, features and all: src/build/Config.zig resolves
+          # b.standardTargetOptions(.{}) against the machine running the build.
+          # This runner has AVX-512, so the default produces a libghostty
+          # carrying AVX-512 instructions - EVEX-encoded vpcmpnleuw / kortestw /
+          # vpmovwb, measured in a UTF-16 -> ASCII narrowing loop - and every
+          # launch on a CPU without them dies with
+          #   0xC000001D STATUS_ILLEGAL_INSTRUCTION
+          # Intel fuses AVX-512 off on every 12th-gen Core and later consumer
+          # part, which is most machines this would ever be downloaded onto.
+          #
+          # Every other packaging path in this repository already passes a CPU
+          # level - flatpak, snap, nix and the debian Dockerfile all use
+          # -Dcpu=baseline, and PACKAGING.md documents it as "avoid building for
+          # newer CPU features that may not be available on all target
+          # machines". Windows was the one path relying on the default.
+          zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu="${ZIG_CPU}"
+
+      - name: Build WinUI shell (Release)
+        if: steps.plan.outputs.do_work == 'true'
+        shell: pwsh
+        working-directory: src
+        run: |
+          # RestoreLockedMode: build exactly what the committed
+          # packages.lock.json files resolve, the way upstream's own
+          # windows-tests.yml does. If this fails, the locks drifted upstream
+          # and the fix belongs there rather than here.
+          dotnet build windows/Ghostty.sln `
+            /p:Platform=$env:PLATFORM /p:Configuration=Release /p:RestoreLockedMode=true
+          if ($LASTEXITCODE -ne 0) { throw "build failed exit=$LASTEXITCODE" }
+
+      - name: Publish NativeAOT binary
+        if: steps.plan.outputs.do_work == 'true'
+        shell: pwsh
+        working-directory: src
+        run: |
+          # pwsh, not bash. Git Bash's MSYS2 runtime rewrites a `/p:...`
+          # argument on the way to the native dotnet.exe, so `/p:Platform=x64`
+          # arrives as `p:Platform=x64` and MSBuild reads it as a second
+          # project:
+          #   MSBUILD : error MSB1008: Only one project can be specified.
+          # windows/scripts/release-smoke.ps1 runs this command under pwsh, so
+          # this step does too. Do not "fix" it back to bash.
+          #
+          # --no-restore because the build step above already restored this
+          # exact graph. It works for win-x64 specifically because the
+          # committed windows/Ghostty/packages.lock.json carries a
+          # `net10.0-windows10.0.19041/win-x64` dependency key, so a plain
+          # restore emits that RID target into project.assets.json. The arm64
+          # workflow cannot use --no-restore for the same reason; see its
+          # header.
+          dotnet publish windows/Ghostty/Ghostty.csproj `
+            -c Release -r $env:RID /p:Platform=$env:PLATFORM --no-restore
+          if ($LASTEXITCODE -ne 0) { throw "NativeAOT publish failed exit=$LASTEXITCODE" }
+
+      - name: Package portable build
+        if: steps.plan.outputs.do_work == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:GITHUB_WORKSPACE $env:SRC
+
+          # Not a hardcoded path: the SDK is free to place the RID publish under
+          # a different folder, which is why release-smoke.ps1 falls back to a
+          # search too. A hardcoded path here would break on the next TFM bump.
+          $exe = Get-ChildItem -Path (Join-Path $src 'windows/Ghostty/bin') -Recurse -Filter 'Wintty.exe' |
+                 Where-Object { $_.FullName -match '\\publish\\' } |
+                 Sort-Object LastWriteTime -Descending |
+                 Select-Object -First 1
+          if (-not $exe) { throw 'publish output (Wintty.exe under a publish folder) not found' }
+          $publishDir = Split-Path $exe.FullName
+          Write-Host "publish dir: $publishDir"
+
+          # #1086: without this resource dll AppNotificationManager.Register()
+          # throws on every launch and every toast is dead. release-smoke.ps1
+          # gates on the same file.
+          $insights = Join-Path $publishDir 'Microsoft.WindowsAppRuntime.Insights.Resource.dll'
+          if (-not (Test-Path $insights)) {
+            throw "publish folder lacks Microsoft.WindowsAppRuntime.Insights.Resource.dll (#1086): every toast would be dead. The Ghostty.csproj publish target that extracts it did not run."
+          }
+
+          # The console shim reaches the publish folder through
+          # CopyCliShimForPublish. Its absence degrades the CLI rather than
+          # breaking the app, so this warns instead of failing the night.
+          $shim = Join-Path $publishDir 'bin\wintty.exe'
+          if (-not (Test-Path $shim)) {
+            Write-Host "::warning::CLI shim missing at $shim (CopyCliShimForPublish did not run)"
+          }
+
+          if (Test-Path $env:ARTIFACT) { Remove-Item $env:ARTIFACT -Force }
+          Compress-Archive -Path (Join-Path $publishDir '*') -DestinationPath $env:ARTIFACT -CompressionLevel Optimal
+
+          $hash = (Get-FileHash $env:ARTIFACT -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($env:ARTIFACT)" | Out-File -Encoding ascii "$($env:ARTIFACT).sha256"
+
+          Get-Item $env:ARTIFACT | Select-Object Name, Length | Format-List
+          Write-Host "sha256: $hash"
+
+      - name: Publish nightly release
+        if: steps.plan.outputs.do_work == 'true' && inputs.skip_release != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_SHA: ${{ steps.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          short=${UPSTREAM_SHA:0:7}
+          date=$(date -u +%Y%m%d)
+          tag="wintty-nightly-${PLATFORM}-${date}-${short}"
+          title="Wintty nightly ${date} (${PLATFORM}, ${short})"
+          hash=$(cut -d' ' -f1 < "${ARTIFACT}.sha256")
+
+          # printf with single-quoted formats: no backtick escaping, no heredoc.
+          {
+            printf 'Unsigned portable Windows %s build of `%s@%s`, commit `%s`.\n\n' \
+              "$PLATFORM" "$UPSTREAM_REPO" "$UPSTREAM_BRANCH" "$UPSTREAM_SHA"
+            printf -- '- Upstream commit: https://github.com/%s/commit/%s\n' "$UPSTREAM_REPO" "$UPSTREAM_SHA"
+            printf -- '- SHA256: `%s`\n' "$hash"
+            printf -- '- Built by: `.github/workflows/nightly-%s.yml`\n\n' "$PLATFORM"
+            printf '**Unofficial build.** Not a Wintty release - the official builds live at https://github.com/%s. It is an unreviewed tip of the upstream branch, so a nightly can be broken.\n' "$UPSTREAM_REPO"
+          } > notes.md
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${ARTIFACT}" "${ARTIFACT}.sha256" --clobber
+          else
+            gh release create "$tag" "${ARTIFACT}" "${ARTIFACT}.sha256" \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --title "$title" \
+              --notes-file notes.md
+          fi

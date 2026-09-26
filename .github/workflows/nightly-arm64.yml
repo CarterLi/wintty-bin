@@ -1,0 +1,253 @@
+# Nightly Windows arm64 build of deblasis/wintty, published as a prerelease of
+# this repository. See .github/workflows/nightly-x64.yml for the parts that are
+# the same on both platforms; this header only covers what differs.
+#
+# arm64 is cross-compiled from the x64 runner, not built on an arm64 one. That
+# is upstream's own arrangement, not a shortcut: Ghostty.csproj derives the
+# console shim's target triple from $(Platform) with an explicit
+# `aarch64-windows` case, commented "an ARM64 package produced on an x64 agent
+# gets an x64 shim beside an ARM64 Wintty.exe", and src/build/GhosttyLib.zig
+# maps .aarch64 onto the Windows SDK's `arm64` UCRT directory. The
+# windows-latest image carries Microsoft.VisualStudio.Component.VC.Tools.ARM64
+# / .ARM64EC and Windows SDK 10.0.26100, so both halves have what they need.
+#
+# The one build that has not been run end to end is the zig side: libghostty
+# for aarch64-windows has not been produced anywhere yet. Everything below it -
+# the restore, the ARM64 solution build, and the RID publish - has.
+name: nightly arm64
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Rebuild and republish even if this commit already has a nightly"
+        required: false
+        default: "false"
+      skip_release:
+        description: "Build, but do not publish a release"
+        required: false
+        default: "false"
+
+concurrency:
+  group: nightly-arm64
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: deblasis/wintty
+  UPSTREAM_BRANCH: windows
+  SRC: src
+  PLATFORM: arm64
+  RID: win-arm64
+  # Cross-compiling, so the target has to be named: without -Dtarget, zig builds
+  # for the host and this runner would produce an x64 libghostty to sit beside
+  # an ARM64 Wintty.exe. baseline for the same reason the x64 workflow picks
+  # x86_64_v3 rather than the default - a cross target already defaults to the
+  # architecture's generic model, and naming it keeps that from being an
+  # accident of the default. aarch64 has no AVX-512-style fragmentation to
+  # dodge, so there is no level above baseline worth naming.
+  ZIG_TARGET: aarch64-windows
+  ZIG_CPU: baseline
+  ARTIFACT: wintty-nightly-win-arm64.zip
+
+jobs:
+  build:
+    # See the x64 workflow: update this if the repository moves, or every run
+    # is skipped silently.
+    if: github.repository_owner == 'CarterLi'
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Clone ${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${UPSTREAM_BRANCH}" \
+            "https://github.com/${UPSTREAM_REPO}.git" "${SRC}"
+
+          sha=$(git -C "${SRC}" rev-parse HEAD)
+          test -n "$sha" || { echo "::error::could not resolve the cloned HEAD"; exit 1; }
+          echo "upstream commit: ${sha}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+          zig_version=$(sed -n 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "${SRC}/build.zig.zon")
+          test -n "$zig_version" || { echo "::error::no .minimum_zig_version in ${SRC}/build.zig.zon"; exit 1; }
+          echo "zig version: ${zig_version}"
+          echo "zig_version=${zig_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether a nightly is needed
+        id: plan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_SHA: ${{ steps.src.outputs.sha }}
+          FORCE: ${{ inputs.force_build }}
+        run: |
+          set -euo pipefail
+          short=${UPSTREAM_SHA:0:7}
+          tags=$(gh release list --limit 100 --json tagName --jq '.[].tagName')
+
+          case "$tags" in
+            *"-${PLATFORM}-"*"-${short}") published=true ;;
+            *)                            published=false ;;
+          esac
+
+          if [ "$published" = "false" ] || [ "$FORCE" = "true" ]; then
+            do_work=true
+          else
+            do_work=false
+          fi
+
+          {
+            echo "### Nightly plan (${PLATFORM})"
+            echo ""
+            echo "- upstream: \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`"
+            echo "- commit: \`${UPSTREAM_SHA}\`"
+            echo "- nightly already published for this commit: ${published}"
+            echo "- build: ${do_work}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "do_work=${do_work}" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        if: steps.plan.outputs.do_work == 'true'
+        with:
+          version: ${{ steps.src.outputs.zig_version }}
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        if: steps.plan.outputs.do_work == 'true'
+        with:
+          global-json-file: src/global.json
+
+      - name: Verify toolchain
+        if: steps.plan.outputs.do_work == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig version
+          dotnet --version
+
+      - name: Build libghostty (ReleaseFast, aarch64-windows)
+        if: steps.plan.outputs.do_work == 'true'
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          zig build -Dapp-runtime=none -Doptimize=ReleaseFast \
+            -Dtarget="${ZIG_TARGET}" -Dcpu="${ZIG_CPU}"
+
+      - name: Build WinUI shell (Release, ARM64)
+        if: steps.plan.outputs.do_work == 'true'
+        shell: pwsh
+        working-directory: src
+        run: |
+          # The solution maps ARM64 for every project, and the Ghostty.csproj
+          # ARM64 conditions pull conpty.dll / OpenConsole.exe /
+          # dxcompiler.dll from their packages' arm64 folders - each of which is
+          # an Error, not a warning, if the package stops shipping them.
+          dotnet build windows/Ghostty.sln `
+            /p:Platform=$env:PLATFORM /p:Configuration=Release /p:RestoreLockedMode=true
+          if ($LASTEXITCODE -ne 0) { throw "build failed exit=$LASTEXITCODE" }
+
+      - name: Publish NativeAOT binary (win-arm64)
+        if: steps.plan.outputs.do_work == 'true'
+        shell: pwsh
+        working-directory: src
+        run: |
+          # pwsh, not bash: Git Bash's MSYS2 runtime rewrites a `/p:...`
+          # argument on the way to the native dotnet.exe, and MSBuild then reads
+          # it as a second project (MSB1008).
+          #
+          # No --no-restore and no RestoreLockedMode, unlike the x64 workflow.
+          # The committed windows/Ghostty/packages.lock.json is win-x64-locked -
+          # its dependency keys are `net10.0-windows10.0.19041` and
+          # `net10.0-windows10.0.19041/win-x64` - so a locked restore for
+          # win-arm64 fails NU1004 ("the project's runtime identifier changed"),
+          # and there is no arm64 lock to lock against: upstream only ever
+          # restores the x64 RID. Letting publish restore is what makes the RID
+          # target appear in project.assets.json. The side effect is that this
+          # leg resolves packages unlocked, and rewrites the three
+          # packages.lock.json files in the throwaway clone.
+          dotnet publish windows/Ghostty/Ghostty.csproj `
+            -c Release -r $env:RID /p:Platform=$env:PLATFORM
+          if ($LASTEXITCODE -ne 0) { throw "NativeAOT publish failed exit=$LASTEXITCODE" }
+
+      - name: Package portable build
+        if: steps.plan.outputs.do_work == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:GITHUB_WORKSPACE $env:SRC
+
+          $exe = Get-ChildItem -Path (Join-Path $src 'windows/Ghostty/bin') -Recurse -Filter 'Wintty.exe' |
+                 Where-Object { $_.FullName -match '\\publish\\' } |
+                 Sort-Object LastWriteTime -Descending |
+                 Select-Object -First 1
+          if (-not $exe) { throw 'publish output (Wintty.exe under a publish folder) not found' }
+          $publishDir = Split-Path $exe.FullName
+          Write-Host "publish dir: $publishDir"
+
+          # #1086: without this resource dll AppNotificationManager.Register()
+          # throws on every launch and every toast is dead.
+          $insights = Join-Path $publishDir 'Microsoft.WindowsAppRuntime.Insights.Resource.dll'
+          if (-not (Test-Path $insights)) {
+            throw "publish folder lacks Microsoft.WindowsAppRuntime.Insights.Resource.dll (#1086): every toast would be dead. The Ghostty.csproj publish target that extracts it did not run."
+          }
+
+          $shim = Join-Path $publishDir 'bin\wintty.exe'
+          if (-not (Test-Path $shim)) {
+            Write-Host "::warning::CLI shim missing at $shim (CopyCliShimForPublish did not run)"
+          }
+
+          if (Test-Path $env:ARTIFACT) { Remove-Item $env:ARTIFACT -Force }
+          Compress-Archive -Path (Join-Path $publishDir '*') -DestinationPath $env:ARTIFACT -CompressionLevel Optimal
+
+          $hash = (Get-FileHash $env:ARTIFACT -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($env:ARTIFACT)" | Out-File -Encoding ascii "$($env:ARTIFACT).sha256"
+
+          Get-Item $env:ARTIFACT | Select-Object Name, Length | Format-List
+          Write-Host "sha256: $hash"
+
+      - name: Publish nightly release
+        if: steps.plan.outputs.do_work == 'true' && inputs.skip_release != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_SHA: ${{ steps.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          short=${UPSTREAM_SHA:0:7}
+          date=$(date -u +%Y%m%d)
+          tag="wintty-nightly-${PLATFORM}-${date}-${short}"
+          title="Wintty nightly ${date} (${PLATFORM}, ${short})"
+          hash=$(cut -d' ' -f1 < "${ARTIFACT}.sha256")
+
+          {
+            printf 'Unsigned portable Windows %s build of `%s@%s`, commit `%s`.\n\n' \
+              "$PLATFORM" "$UPSTREAM_REPO" "$UPSTREAM_BRANCH" "$UPSTREAM_SHA"
+            printf -- '- Upstream commit: https://github.com/%s/commit/%s\n' "$UPSTREAM_REPO" "$UPSTREAM_SHA"
+            printf -- '- SHA256: `%s`\n' "$hash"
+            printf -- '- Built by: `.github/workflows/nightly-%s.yml`\n\n' "$PLATFORM"
+            printf '**Unofficial build.** Not a Wintty release - the official builds live at https://github.com/%s. It is an unreviewed tip of the upstream branch, so a nightly can be broken.\n' "$UPSTREAM_REPO"
+          } > notes.md
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${ARTIFACT}" "${ARTIFACT}.sha256" --clobber
+          else
+            gh release create "$tag" "${ARTIFACT}" "${ARTIFACT}.sha256" \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --title "$title" \
+              --notes-file notes.md
+          fi
